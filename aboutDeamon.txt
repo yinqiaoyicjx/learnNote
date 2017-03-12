@@ -1,0 +1,63 @@
+﻿
+没有父进程的进程就是孤儿进程，孤儿进程会被init领养，成为一个准守护进程。
+
+如果进程他爹活着，但是不给子进程收尸（wait、waitpid），子进程就会变成僵尸。
+
+守护进程（Daemon）是在一类脱离终端在后台执行的程序, 通常以 d 结尾, 随系统启动, 其父进程 (ppid) 通常是 init 进程
+
+守护进程应该有以下几个特征：
+
+1.后台运行
+
+也就是不占用console的前面，也就是bash里运行程序后面加个&
+
+2.成为process group leader
+
+Process Group Leader就是父进程是init的那个进程。
+
+3.成为session leader
+
+一个ssh登录会启动一个bash，bash会fork出很多子进程，这些进程轮流接手tty输出。这都是属于一个session。 session leader就是这一堆进程的父进程。
+
+4.fork一次或者两次
+
+fork 两次是出于被当成库调用的考虑。
+
+5.chdir到/
+
+防止占用别的路径的working dir的fd，导致一些block不能unmount
+
+6.umask
+
+需要重置umask，防止后续子进程继承非默认umask造成奇怪的行为。
+
+7.处理标准输入输出，错误输出（0，1，2）
+
+重定向stdout、stderr、stdin，防止tty中断后的broken pipe信号。
+
+8.日志
+
+输出重定向后，需要有办法反映内部情况。
+9.信号处理
+
+最后最好对将一些终端相关的信号处理忽略一下，防止受到相关信号导致的进程退出。例如：SIGHUP、SIGTTIN、SIGTTOU。这是很多没有经验的菜鸟容易忽略的点。
+一般nohup命令会帮我们处理。
+
+*nix可以Fork子进程，windows里不行，用from multiprocessing import Process，如果要启动大量的子进程，可以用进程池的方式批量创建子进程：
+from multiprocessing import Pool，通信用queue。
+
+dup2传入两个文件描述符，fd1和fd2（fd1是必须存在的），如果fd2存在，就关闭fd2，然后将fd1代表的那个文件（可以想象成是P_fd1指针）强行复制给fd2，
+fd2这个文件描述符不会发生变化，但是fd2指向的文件就变成了fd1指向的文件。
+import os
+#打开一个文件
+f=open('txt','a')
+#将这个文件描述符代表的文件，传递给1描述符指向的文件（也就是stdout）
+os.dup2(f.fileno(),1)
+f.close()
+#print输出到标准输出流，就是文件描述符1
+print 'line1'
+print 'line2'
+#脚本执行结果：
+#生成一个txt文件，内容是：
+#line1
+#line2

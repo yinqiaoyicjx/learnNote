@@ -1,0 +1,271 @@
+Flask源码0.1版本解读
+_request_ctx_stack = LocalStack()
+current_app = LocalProxy(lambda: _request_ctx_stack.top.app)
+request = LocalProxy(lambda: _request_ctx_stack.top.request)
+session = LocalProxy(lambda: _request_ctx_stack.top.session)
+g = LocalProxy(lambda: _request_ctx_stack.top.g)
+
+每一段程序都有很多外部变量。只有像Add这种简单的函数才是没有外部变量的。一旦你的一段程序有了外部变量，这段程序就不完整，不能独立运行。
+你为了使他们运行，就要给所有的外部变量一个一个写一些值进去。这些值的集合就叫上下文。 -- vzch
+Flask上下文管理是利用werkzeug的LocalStark和LocalProxy
+
+LocalStark是一个基于Local类的栈，
+    >>> ls = LocalStack()
+    >>> ls.push(42)
+    >>> ls.top
+    42
+    >>> ls.push(23)
+    >>> ls.top
+    23
+    >>> ls.pop()
+    23
+    >>> ls.top
+    42
+函数有__init__,__release_local__,__call__,push,pop,top
+def __init__(self):
+        self._local = Local() #_local是关键，里面的操作都是对_local进行处理
+        self._lock = allocate_lock() #创建一个线程锁，使用时申请索_lock.acquire(),结束是释放锁_lock.release()
+
+Local类：
+class Local(object):
+    __slots__ = ('__storage__', '__lock__')#__slots__是插槽，即这个类只能有这两个属性
+    def __init__(self):
+        object.__setattr__(self, '__storage__', {})#字典
+        object.__setattr__(self, '__lock__', allocate_lock())
+    def __iter__(self):
+    def __call__(self, proxy):
+        """Create a proxy for a name."""
+        return LocalProxy(self, proxy)
+
+    def __release_local__(self):
+        self.__storage__.pop(get_ident(), None)
+
+    def __getattr__(self, name):
+        self.__lock__.acquire()
+        try:
+            try:
+                return self.__storage__[get_ident()][name]
+            except KeyError:
+                raise AttributeError(name)
+        finally:
+            self.__lock__.release()
+
+    def __setattr__(self, name, value):
+        self.__lock__.acquire()
+        try:
+            ident = get_ident()
+            storage = self.__storage__
+            if ident in storage:
+                storage[ident][name] = value
+            else:
+                storage[ident] = {name: value}
+        finally:
+            self.__lock__.release()
+
+    def __delattr__(self, name):
+        self.__lock__.acquire()
+        try:
+            try:
+                del self.__storage__[get_ident()][name]
+            except KeyError:
+                raise AttributeError(name)
+        finally:
+            self.__lock__.release()
+Local类重新写了setattr,getattr,delattr。
+其中get_ident()是获取当前协程/线程ID，对不同ID进行分别存储。storage[ident] = {name: value}
+首先尝试着从greenlet（协程）导入getcurrent方法，如果flask跑在了像gevent的时候
+所以的请求都是以greenlet作为最小单位，
+try:
+    from greenlet import getcurrent as get_ident
+except ImportError:
+    try:
+        from thread import get_ident
+    except ImportError:
+        from _thread import get_ident
+
+LocalProxy类：
+是一个Local代理，LocalProxy主要是就一个代理，对Local的代理。把所以作用到自己的操作全部转发到它所代理对象上。
+__slots__ = ('__local', '__dict__', '__name__')
+    def __init__(self, local, name=None):
+        object.__setattr__(self, '_LocalProxy__local', local)
+        object.__setattr__(self, '__name__', name)
+    def _get_current_object(self):
+        if not hasattr(self.__local, '__release_local__'):
+            return self.__local()
+        try:
+            return getattr(self.__local, self.__name__)
+        except AttributeError:
+            raise RuntimeError('no object bound to %s' % self.__name__)
+    然后重写一大堆魔法方法，把所进行操作转到代理对象：
+    __setattr__ = lambda x, n, v: setattr(x._get_current_object(), n, v)
+    __delattr__ = lambda x, n: delattr(x._get_current_object(), n)
+    __str__ = lambda x: str(x._get_current_object())
+    __lt__ = lambda x, o: x._get_current_object() < o
+    。。。
+
+
+flask 核心有两个库：werkzeug,jinja2
+werkzeug核心的逻辑，比如路由，请求和应答的封装，
+jinja负责模板的渲染，渲染返回给用户的 html 文件内容
+
+server服务器-WSGI－中间件－app应用程序
+
+flask应用启动方法是app.run()
+def run(self, host='localhost', port=5000, **options):
+        from werkzeug import run_simple
+        if 'debug' in options:
+            self.debug = options.pop('debug')
+        options.setdefault('use_reloader', self.debug)
+        options.setdefault('use_debugger', self.debug)
+        return run_simple(host, port, self, **options)
+run_simple()是werkzeug.serving里的函数，最简是三个参数，
+它的功能就行：监听在指定的端口，收到 HTTP 请求的时候解析为 WSGI 格式，然后调用 app 去执行处理的逻辑。
+对应的执行逻辑在 werkzeug.serving:WSGIRequestHandler 的 run_wsgi 中
+
+def run_simple(hostname, port, application)
+    if static_files:
+        from werkzeug.wsgi import SharedDataMiddleware
+        application = SharedDataMiddleware(application, static_files)  #内部有一个静态文件中间器
+    if use_reloader:
+        test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        test_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        test_socket.bind((hostname, port))
+        test_socket.close()
+        run_with_reloader(inner, extra_files, reloader_interval)
+    else:
+        inner()
+    def inner():
+        make_server(hostname, port, application, threaded,
+                    processes, request_handler,
+                    passthrough_errors, ssl_context).serve_forever()
+make_server判断是返回ThreadedWSGIServer，ForkingWSGIServer还是BaseWSGIServer（线程，进程，基础）
+class ThreadedWSGIServer(ThreadingMixIn, BaseWSGIServer)
+class ForkingWSGIServer(ForkingMixIn, BaseWSGIServer)
+BaseWSGIServer是HTTPServer的子类，HTTPServer是Python基础库里的类
+from BaseHTTPServer import HTTPServer, BaseHTTPRequestHandler
+WSGIRequestHandler在BaseWSGIServer的__init__初始化
+
+class WSGIRequestHandlerL:
+    def run_wsgi(self):
+        def execute(app):
+            application_iter = app(environ, start_response)#调用app实例，涉及到了App的__call__函数
+
+class Flask:
+    def __call__(self, environ, start_response):
+        return self.wsgi_app(environ, start_response)
+    def wsgi_app(self, environ, start_response):
+        with self.request_context(environ):
+            rv = self.preprocess_request()#请求前hook处理
+            if rv is None:
+                rv = self.dispatch_request()  #关键的处理请求函数
+            response = self.make_response(rv) #制作Response对象
+            response = self.process_response(response)#请求后hook处理
+            return response(environ, start_response)
+
+    def dispatch_request(self):
+    #找到请求对象 request，获取它的 endpoint，然后从 view_functions 找到对应 endpoint 的 view_func
+    #把请求参数传递过去，进行处理并返回。
+        try:
+            endpoint, values = self.match_request()#
+            return self.view_functions[endpoint](**values)
+        except HTTPException, e:
+            handler = self.error_handlers.get(e.code)
+            if handler is None:
+                return e
+            return handler(e)
+        except Exception, e:
+            handler = self.error_handlers.get(500)
+            if self.debug or handler is None:
+                raise
+            return handler(e)
+def match_request(self):
+        rv = _request_ctx_stack.top.url_adapter.match()#在_RequestContext定义的
+        request.endpoint, request.view_args = rv
+        return rv
+class _RequestContext(object):
+    def __init__(self, app, environ):
+        self.app = app
+        self.url_adapter = app.url_map.bind_to_environ(environ)#把 app 的 url_map 绑定到 WSGI environ 变量上
+        self.request = app.request_class(environ)
+        self.session = app.open_session(self.request)
+        self.g = _RequestGlobals()
+        self.flashes = None
+
+整个 flask 的路由大致的流程：
+1.通过 @app.route 或者 app.add_url_rule 注册应用 url 对应的处理函数
+    def add_url_rule(self, rule, endpoint, **options):
+        options['endpoint'] = endpoint
+        options.setdefault('methods', ('GET',))
+        self.url_map.add(Rule(rule, **options))
+    url_map是 werkzeug.routeing:Map 类的对象，rule是werkzeug.routing:Rule 类的对象
+    werkzeug 提供的路由功能。
+    >>> m = Map([
+    ...     Rule('/', endpoint='index'),
+    ...     Rule('/downloads/', endpoint='downloads/index'),
+    ...     Rule('/downloads/<int:id>', endpoint='downloads/show')
+    ... ])
+    >>> urls = m.bind("example.com", "/")
+    >>> urls.match("/", "GET")
+    ('index', {})
+    >>> urls.match("/downloads/42")
+    ('downloads/show', {'id': 42})
+
+    >>> urls.match("/downloads")
+    Traceback (most recent call last):
+    ...
+    RequestRedirect: http://example.com/downloads/
+    >>> urls.match("/missing")
+    Traceback (most recent call last):
+    ...
+    NotFound: 404 Not Found
+2.每次请求过来的时候，会事先调用路由匹配的逻辑，把路由结果保存起来
+3.dispatch_request 根据保存的路由结果，调用对应的视图函数
+
+
+Request对象和Response对象
+from werkzeug import Request as RequestBase, Response as ResponseBase
+在werkzeug里Request没有任何的 body。但是有多个基类，第一个是 BaseRequest，其他的都是各种 Mixin
+class Request(BaseRequest, AcceptMixin, ETagRequestMixin,
+              UserAgentMixin, AuthorizationMixin,
+              CommonRequestDescriptorsMixin):
+
+BaseRequest主要对environ进行保存，里面有两个常用的装饰器
+@property    @cached_property
+@property 装饰符能够把类的方法变成属性
+@cached_property是 @property 的升级版，添加了缓存功能。只有第一次访问的时候才会调用底层的方法，后续的方法会直接使用之前返回的值
+
+HTTP 响应分为三个部分： 状态栏（HTTP 版本、状态码和说明）、头部（以冒号隔开的字符对，用于各种控制和协商）、body（服务端返回的数据）。
+在flask中不用和response打交道，只需编写视图函数，flask会自动生成响应
+在wsgi_app函数中调用了make_response函数
+def make_response(self, rv):
+        """
+        The following types are allowd for `rv`:
+        ======================= ===========================================
+        :attr:`response_class`  the object is returned unchanged
+        :class:`str`            a response object is created with the
+                                string as body
+        :class:`unicode`        a response object is created with the
+                                string encoded to utf-8 as body
+        :class:`tuple`          the response object is created with the
+                                contents of the tuple as arguments
+        a WSGI function         the function is called as WSGI application
+                                and buffered as response object
+        ======================= ===========================================
+        :param rv: the return value from the view function
+        """
+        if isinstance(rv, self.response_class):
+            return rv
+        if isinstance(rv, basestring):
+            return self.response_class(rv)
+        if isinstance(rv, tuple):
+            return self.response_class(*rv)
+        return self.response_class.force_type(rv, request.environ)
+对rv进行分类，最终返回Response对象，Response也用了Mixin机制，主要类是Baseresponse
+class BaseResponse(object):
+    charset = 'utf-8'
+    default_status = 200
+    default_mimetype = 'text/plain'
+    automatically_set_content_length = True
+    def __init__(self, response=None, status=None, headers=None,
+                 mimetype=None, content_type=None, direct_passthrough=False):
+
